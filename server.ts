@@ -1,7 +1,6 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import mysql from "mysql2/promise";
-import Database from "better-sqlite3";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
@@ -12,45 +11,28 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-let dbType: 'mysql' | 'sqlite' = 'sqlite';
 let mysqlPool: any = null;
-let sqliteDb: any = null;
 
 async function initDb() {
-  // Try MySQL first if DB_HOST is provided
-  if (process.env.DB_HOST) {
-    try {
-      mysqlPool = mysql.createPool({
-        host: process.env.DB_HOST,
-        user: process.env.DB_USER || 'root',
-        password: process.env.DB_PASSWORD || '',
-        database: process.env.DB_NAME || 'order_book',
-        port: parseInt(process.env.DB_PORT || '3306'),
-        connectTimeout: 10000,
-        waitForConnections: true,
-        connectionLimit: 10
-      });
-      
-      // Test connection
-      const conn = await mysqlPool.getConnection();
-      conn.release();
-      dbType = 'mysql';
-      console.log("✅ Connected to Hostinger MySQL Database:", process.env.DB_NAME);
-    } catch (err) {
-      console.error("❌ MySQL connection failed:", (err as Error).message);
-      console.warn("⚠️  Falling back to SQLite...");
-      dbType = 'sqlite';
-    }
-  }
+  mysqlPool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'order_book',
+    port: parseInt(process.env.DB_PORT || '3306'),
+    connectTimeout: 10000,
+    waitForConnections: true,
+    connectionLimit: 10
+  });
 
-  if (dbType === 'sqlite') {
-    sqliteDb = new Database("orders.db");
-    console.log("Using SQLite Database (Fallback)");
-  }
+  // Test connection
+  const conn = await mysqlPool.getConnection();
+  conn.release();
+  console.log("✅ Connected to MySQL Database:", process.env.DB_NAME || 'order_book');
 
   const queries = [
     `CREATE TABLE IF NOT EXISTS products (
-      id ${dbType === 'mysql' ? 'INT PRIMARY KEY AUTO_INCREMENT' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      id INT PRIMARY KEY AUTO_INCREMENT,
       title VARCHAR(255) NOT NULL,
       isbn VARCHAR(50) UNIQUE NOT NULL,
       publisher VARCHAR(255) NOT NULL,
@@ -73,7 +55,7 @@ async function initDb() {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`,
     `CREATE TABLE IF NOT EXISTS order_items (
-      id ${dbType === 'mysql' ? 'INT PRIMARY KEY AUTO_INCREMENT' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      id INT PRIMARY KEY AUTO_INCREMENT,
       order_id VARCHAR(50) NOT NULL,
       product_id INT NOT NULL,
       quantity INT NOT NULL,
@@ -87,21 +69,13 @@ async function initDb() {
     )`
   ];
 
-  if (dbType === 'mysql') {
-    for (const q of queries) await mysqlPool.query(q);
-    try { await mysqlPool.query("ALTER TABLE products ADD COLUMN description TEXT"); } catch (e) {} // Ignore if exists
-    await mysqlPool.query("INSERT IGNORE INTO settings (\`key\`, value) VALUES ('header_title', 'Empowering Schools through Quality Literacy Programs.')");
-  } else {
-    for (const q of queries) sqliteDb.exec(q);
-    try { sqliteDb.exec("ALTER TABLE products ADD COLUMN description TEXT"); } catch (e) {} // Ignore if exists
-    sqliteDb.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").run('header_title', 'Empowering Schools through Quality Literacy Programs.');
-  }
+  for (const q of queries) await mysqlPool.query(q);
+  try { await mysqlPool.query("ALTER TABLE products ADD COLUMN description TEXT"); } catch (e) {} // Ignore if exists
+  await mysqlPool.query("INSERT IGNORE INTO settings (\`key\`, value) VALUES ('header_title', 'Empowering Schools through Quality Literacy Programs.')");
 
   // Seed initial products
-  const countQuery = "SELECT COUNT(*) as count FROM products";
-  const rows: any = dbType === 'mysql' ? (await mysqlPool.query(countQuery))[0] : [sqliteDb.prepare(countQuery).get()];
-  
-  if (rows[0].count === 0) {
+  const [[{ count }]]: any = await mysqlPool.query("SELECT COUNT(*) as count FROM products");
+  if (count === 0) {
     const initialProducts = [
       ["Wonder", "978-014-136-544-1", "Penguin UK", "Intermediate", 145000, "https://picsum.photos/seed/wonder/400/600"],
       ["National Geographic Kids: Sharks", "978-142-631-104-2", "National Geographic", "Beginner", 95000, "https://picsum.photos/seed/sharks/400/600"],
@@ -111,10 +85,7 @@ async function initDb() {
       ["DK Eyewitness: Ancient Egypt", "978-024-134-567-6", "DK UK", "Advanced", 175000, "https://picsum.photos/seed/egypt/400/600"]
     ];
     const insertQ = "INSERT INTO products (title, isbn, publisher, level, price, image_url) VALUES (?, ?, ?, ?, ?, ?)";
-    for (const p of initialProducts) {
-      if (dbType === 'mysql') await mysqlPool.query(insertQ, p);
-      else sqliteDb.prepare(insertQ).run(...p);
-    }
+    for (const p of initialProducts) await mysqlPool.query(insertQ, p);
   }
 }
 
@@ -125,16 +96,10 @@ async function startServer() {
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-  // Helper to run queries on active DB
+  // Helper to run queries
   const query = async (sql: string, params: any[] = []) => {
-    if (dbType === 'mysql') {
-      const [results] = await mysqlPool.query(sql, params);
-      return results;
-    } else {
-      const stmt = sqliteDb.prepare(sql.replace(/\?/g, '?'));
-      if (sql.trim().toUpperCase().startsWith('SELECT')) return stmt.all(...params);
-      return stmt.run(...params);
-    }
+    const [results] = await mysqlPool.query(sql, params);
+    return results;
   };
 
   app.get("/api/products", async (req, res) => {
@@ -151,23 +116,15 @@ async function startServer() {
     const orderId = "ORD-" + Math.random().toString(36).substring(2, 11).toUpperCase();
 
     try {
-      if (dbType === 'mysql') {
-        const conn = await mysqlPool.getConnection();
-        await conn.beginTransaction();
-        try {
-          await conn.query("INSERT INTO orders (id, school_name, pic_name, position, whatsapp, email, total_books, total_revenue) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
-            [orderId, schoolInfo.schoolName, schoolInfo.picName, schoolInfo.position, schoolInfo.whatsapp, schoolInfo.email, totalBooks, totalRevenue]);
-          for (const item of items) await conn.query("INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)", [orderId, item.id, item.quantity, item.price]);
-          await conn.commit();
-        } catch (e) { await conn.rollback(); throw e; }
-        finally { conn.release(); }
-      } else {
-        const transaction = sqliteDb.transaction(() => {
-          sqliteDb.prepare("INSERT INTO orders (id, school_name, pic_name, position, whatsapp, email, total_books, total_revenue) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(orderId, schoolInfo.schoolName, schoolInfo.picName, schoolInfo.position, schoolInfo.whatsapp, schoolInfo.email, totalBooks, totalRevenue);
-          for (const item of items) sqliteDb.prepare("INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)").run(orderId, item.id, item.quantity, item.price);
-        });
-        transaction();
-      }
+      const conn = await mysqlPool.getConnection();
+      await conn.beginTransaction();
+      try {
+        await conn.query("INSERT INTO orders (id, school_name, pic_name, position, whatsapp, email, total_books, total_revenue) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
+          [orderId, schoolInfo.schoolName, schoolInfo.picName, schoolInfo.position, schoolInfo.whatsapp, schoolInfo.email, totalBooks, totalRevenue]);
+        for (const item of items) await conn.query("INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)", [orderId, item.id, item.quantity, item.price]);
+        await conn.commit();
+      } catch (e) { await conn.rollback(); throw e; }
+      finally { conn.release(); }
 
       // Send Email Notification to Admin
       if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
@@ -303,37 +260,21 @@ async function startServer() {
     if (!Array.isArray(products)) return res.status(400).json({ error: "Invalid data format" });
 
     try {
-      if (dbType === 'mysql') {
-        const conn = await mysqlPool.getConnection();
-        await conn.beginTransaction();
-        try {
-          const queryStr = `
-            INSERT INTO products (title, isbn, publisher, level, price, image_url) 
-            VALUES (?, ?, ?, ?, ?, ?) 
-            ON DUPLICATE KEY UPDATE 
-            title=VALUES(title), publisher=VALUES(publisher), level=VALUES(level), price=VALUES(price)
-          `;
-          for (const p of products) {
-            await conn.query(queryStr, [p.title, p.isbn, p.publisher, p.level || 'Beginner', p.price || 0, p.image_url || '']);
-          }
-          await conn.commit();
-        } catch (e) { await conn.rollback(); throw e; }
-        finally { conn.release(); }
-      } else {
-        const transaction = sqliteDb.transaction(() => {
-          const queryStr = `
-            INSERT INTO products (title, isbn, publisher, level, price, image_url) 
-            VALUES (?, ?, ?, ?, ?, ?) 
-            ON CONFLICT(isbn) DO UPDATE SET 
-            title=excluded.title, publisher=excluded.publisher, level=excluded.level, price=excluded.price
-          `;
-          const stmt = sqliteDb.prepare(queryStr);
-          for (const p of products) {
-            stmt.run(p.title, p.isbn, p.publisher, p.level || 'Beginner', p.price || 0, p.image_url || '');
-          }
-        });
-        transaction();
-      }
+      const conn = await mysqlPool.getConnection();
+      await conn.beginTransaction();
+      try {
+        const queryStr = `
+          INSERT INTO products (title, isbn, publisher, level, price, image_url) 
+          VALUES (?, ?, ?, ?, ?, ?) 
+          ON DUPLICATE KEY UPDATE 
+          title=VALUES(title), publisher=VALUES(publisher), level=VALUES(level), price=VALUES(price)
+        `;
+        for (const p of products) {
+          await conn.query(queryStr, [p.title, p.isbn, p.publisher, p.level || 'Beginner', p.price || 0, p.image_url || '']);
+        }
+        await conn.commit();
+      } catch (e) { await conn.rollback(); throw e; }
+      finally { conn.release(); }
       res.json({ success: true, count: products.length });
     } catch (error: any) {
       console.error(error);
@@ -368,15 +309,8 @@ async function startServer() {
 
   app.post("/api/settings", async (req, res) => {
     try {
-      if (dbType === 'mysql') {
-        for (const [key, value] of Object.entries(req.body)) {
-          await mysqlPool.query("INSERT INTO settings (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = ?", [key, value, value]);
-        }
-      } else {
-        const stmt = sqliteDb.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
-        for (const [key, value] of Object.entries(req.body)) {
-          stmt.run(key, value);
-        }
+      for (const [key, value] of Object.entries(req.body)) {
+        await mysqlPool.query("INSERT INTO settings (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = ?", [key, value, value]);
       }
       res.json({ success: true });
     } catch (error) {
@@ -407,7 +341,7 @@ async function startServer() {
     app.get("*", (req, res) => res.sendFile(path.join(__dirname, "dist", "index.html")));
   }
 
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || "3000");
   app.listen(PORT, "0.0.0.0", () => console.log(`Server running on http://localhost:${PORT}`));
 }
 
